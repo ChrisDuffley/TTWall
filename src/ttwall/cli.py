@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import queue
 import sys
+import threading
 from pathlib import Path
 
 from .config import AppConfig, default_config_path, load_config, write_default_config
-from .protocol import TeamTalkClient, TeamTalkError
+from .protocol import (
+    MSGTYPE_BROADCAST,
+    MSGTYPE_CHANNEL,
+    MSGTYPE_USER,
+    DeliveredMessage,
+    TeamTalkClient,
+    TeamTalkError,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -35,6 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
     broadcast_parser = subparsers.add_parser("send-broadcast", help="Send a broadcast message")
     _add_common_options(broadcast_parser)
     broadcast_parser.add_argument("message", help="The message content")
+
+    interactive_parser = subparsers.add_parser("interactive", help="Start an interactive TeamTalk shell")
+    _add_common_options(interactive_parser)
+    interactive_parser.add_argument("--channel", help="Channel to join on startup (name, path, or ID)")
+    interactive_parser.add_argument("--channel-password", default="", help="Password for the startup channel")
 
     return parser
 
@@ -116,6 +130,161 @@ def _run_send_broadcast(args: argparse.Namespace, config: AppConfig) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Interactive shell helpers
+# ---------------------------------------------------------------------------
+
+def _format_message(msg: DeliveredMessage, client: TeamTalkClient) -> str:
+    sender = client.users.get(msg.from_user_id)
+    sender_name = (sender.nickname or sender.username) if sender else f"#{msg.from_user_id}"
+    if msg.msg_type == MSGTYPE_CHANNEL:
+        return f"[{client.get_channel_path(msg.channel_id)}] {sender_name}: {msg.content}"
+    if msg.msg_type == MSGTYPE_USER:
+        return f"[PM from {sender_name}] {msg.content}"
+    if msg.msg_type == MSGTYPE_BROADCAST:
+        return f"[Broadcast] {sender_name}: {msg.content}"
+    return f"[?] {sender_name}: {msg.content}"
+
+
+def _print_interactive_help() -> None:
+    print(
+        "\n  Commands:\n"
+        "    msg <text>              Send a message to the current channel\n"
+        "    private <user> <text>   Send a private message\n"
+        "    broadcast <text>        Send a broadcast message to all users\n"
+        "    join <channel> [pass]   Join a channel (name, path, or ID)\n"
+        "    leave                   Leave the current channel\n"
+        "    users                   List connected users\n"
+        "    channels                List known channels\n"
+        "    status                  Show your current connection status\n"
+        "    help                    Show this help\n"
+        "    quit                    Disconnect and exit\n"
+        "\n  Shortcuts: c/say=msg  p/pm=private  bc=broadcast  u=users  ch=channels\n"
+    )
+
+
+def _print_users(client: TeamTalkClient) -> None:
+    if not client.users:
+        print("  No users visible.")
+        return
+    for u in sorted(client.users.values(), key=lambda x: x.user_id):
+        chan = client.get_channel_path(u.channel_id) if u.channel_id else "(no channel)"
+        print(f"  #{u.user_id:<5}  {(u.nickname or u.username):<30}  {chan}")
+
+
+def _print_channels(client: TeamTalkClient) -> None:
+    if not client.channels:
+        print("  No channels visible.")
+        return
+    for ch in sorted(client.channels.values(), key=lambda x: x.channel_id):
+        current = " *" if ch.channel_id == client.current_channel_id else ""
+        print(f"  #{ch.channel_id:<4}  {ch.path(client.channels)}{current}")
+
+
+def _run_interactive(args: argparse.Namespace, config: AppConfig) -> int:
+    try:
+        import readline as _rl  # noqa: F401 - enables line history/editing on Linux/macOS
+    except ImportError:
+        pass
+
+    stop_display = threading.Event()
+
+    with TeamTalkClient.from_config(config) as client:
+        client.connect()
+        client.login()
+        print(
+            f"[Connected] server={client.server_name or config.server.host}"
+            f"  you=#{client.my_user_id} ({config.identity.nickname})"
+        )
+
+        channel_ref = getattr(args, "channel", None) or config.server.channel
+        if channel_ref:
+            channel_password = getattr(args, "channel_password", "") or config.server.channel_password
+            client.join_channel(channel_ref, channel_password)
+            print(f"[Joined] {client.get_channel_path(client.current_channel_id)}")
+
+        client.start_reader()
+
+        def _display_worker() -> None:
+            while not stop_display.is_set():
+                try:
+                    msg = client._message_queue.get(timeout=0.2)
+                    sys.stdout.write(f"\n{_format_message(msg, client)}\n")
+                    sys.stdout.flush()
+                except queue.Empty:
+                    pass
+
+        display_thread = threading.Thread(target=_display_worker, daemon=True, name="ttwall-display")
+        display_thread.start()
+
+        print("Type 'help' for commands, 'quit' to exit.\n")
+        try:
+            while True:
+                try:
+                    raw = input("> ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    break
+
+                if not raw:
+                    continue
+
+                tokens = raw.split(None, 1)
+                cmd = tokens[0].lower()
+                args_str = tokens[1].strip() if len(tokens) > 1 else ""
+
+                try:
+                    if cmd in ("quit", "exit", "q"):
+                        break
+                    elif cmd == "help":
+                        _print_interactive_help()
+                    elif cmd in ("status", "me", "whoami"):
+                        chan = (
+                            client.get_channel_path(client.current_channel_id)
+                            if client.current_channel_id
+                            else "(none)"
+                        )
+                        print(f"  You are #{client.my_user_id} ({config.identity.nickname})  channel: {chan}")
+                    elif cmd in ("users", "u"):
+                        _print_users(client)
+                    elif cmd in ("channels", "ch", "chans"):
+                        _print_channels(client)
+                    elif cmd == "join":
+                        parts = args_str.split(None, 1)
+                        if not parts:
+                            print("  Usage: join <channel> [password]")
+                        else:
+                            client.join_channel(parts[0], parts[1] if len(parts) > 1 else "")
+                            print(f"[Joined] {client.get_channel_path(client.current_channel_id)}")
+                    elif cmd == "leave":
+                        client.leave_channel()
+                        print("[Left channel]")
+                    elif cmd in ("msg", "say", "c"):
+                        if not args_str:
+                            print("  Usage: msg <text>")
+                        else:
+                            client.send_channel_message(args_str)
+                    elif cmd in ("private", "pm", "p"):
+                        parts = args_str.split(None, 1)
+                        if len(parts) < 2:
+                            print("  Usage: private <user> <text>")
+                        else:
+                            client.send_private_message(parts[1], parts[0])
+                    elif cmd in ("broadcast", "bc"):
+                        if not args_str:
+                            print("  Usage: broadcast <text>")
+                        else:
+                            client.send_broadcast_message(args_str)
+                    else:
+                        print(f"  Unknown command: {cmd!r}  (type 'help' for available commands)")
+                except TeamTalkError as exc:
+                    print(f"  Error: {exc}")
+        finally:
+            stop_display.set()
+
+    return 0
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
@@ -135,6 +304,8 @@ def main() -> int:
             return _run_send_private(args, config)
         if args.command == "send-broadcast":
             return _run_send_broadcast(args, config)
+        if args.command == "interactive":
+            return _run_interactive(args, config)
         parser.error(f"Unsupported command: {args.command}")
         return 2
     except TeamTalkError as exc:

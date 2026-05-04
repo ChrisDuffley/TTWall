@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import queue
 import socket
 import ssl
+import threading
 from typing import Protocol
 
 from .config import AppConfig
@@ -228,6 +230,10 @@ class TeamTalkClient:
         self.channels: dict[int, ChannelInfo] = {}
         self.users: dict[int, UserInfo] = {}
         self.messages: list[DeliveredMessage] = []
+        self._reader_thread: threading.Thread | None = None
+        self._command_queues: dict[int, queue.SimpleQueue] = {}
+        self._message_queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._reader_active = False
 
     @classmethod
     def from_config(cls, config: AppConfig) -> "TeamTalkClient":
@@ -257,9 +263,13 @@ class TeamTalkClient:
             raise TeamTalkError(f"Expected TeamTalk welcome command, got {command!r}")
 
     def close(self) -> None:
+        self._reader_active = False
         if self._transport is not None:
             self._transport.close()
             self._transport = None
+        if self._reader_thread is not None:
+            self._reader_thread.join(timeout=2.0)
+            self._reader_thread = None
 
     def login(self) -> None:
         if not self.username:
@@ -298,6 +308,65 @@ class TeamTalkClient:
 
     def send_broadcast_message(self, content: str) -> None:
         self._send_text_message(MSGTYPE_BROADCAST, content)
+
+    def leave_channel(self) -> None:
+        if self.current_channel_id == 0:
+            return
+        result = self._wait_for_command(self._send_command("leave"))
+        if not result.ok:
+            assert result.error is not None
+            raise TeamTalkError(f"Leave failed: {result.error.message}")
+
+    def start_reader(self) -> None:
+        """Start a background thread to continuously read server events (for interactive mode)."""
+        self._reader_active = True
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop, daemon=True, name="ttwall-reader"
+        )
+        self._reader_thread.start()
+
+    def _reader_loop(self) -> None:
+        current_begin_id = 0
+        ok_seen = False
+        error_seen: CommandError | None = None
+
+        while self._reader_active:
+            try:
+                line = self._readline()
+            except (TeamTalkError, OSError):
+                break
+            try:
+                command, params = parse_command_line(line)
+            except ValueError:
+                continue
+
+            self._handle_server_command(command, params)
+
+            if command == "begin":
+                current_begin_id = self._int_param(params, "id")
+                ok_seen = False
+                error_seen = None
+            elif command == "ok":
+                ok_seen = True
+            elif command == "error":
+                error_seen = CommandError(
+                    number=self._int_param(params, "number"),
+                    message=params.get("message", "Unknown TeamTalk error"),
+                )
+            elif command == "end":
+                end_id = self._int_param(params, "id")
+                if end_id == current_begin_id:
+                    q = self._command_queues.pop(end_id, None)
+                    if q is not None:
+                        q.put(CommandResult(
+                            command_id=end_id,
+                            ok=ok_seen and error_seen is None,
+                            error=error_seen,
+                        ))
+                    current_begin_id = 0
+            elif command == "messagedeliver":
+                if self.messages:
+                    self._message_queue.put(self.messages[-1])
 
     def resolve_user_id(self, user_ref: int | str) -> int:
         if isinstance(user_ref, int):
@@ -357,6 +426,9 @@ class TeamTalkClient:
         command_id = self._next_command_id
         self._next_command_id += 1
 
+        if self._reader_active:
+            self._command_queues[command_id] = queue.SimpleQueue()
+
         parts = [command]
         for key, value in params.items():
             if value is None:
@@ -373,6 +445,15 @@ class TeamTalkClient:
         return command_id
 
     def _wait_for_command(self, command_id: int) -> CommandResult:
+        if self._reader_active:
+            q = self._command_queues.get(command_id)
+            if q is None:
+                raise TeamTalkError(f"No registered queue for command {command_id}")
+            try:
+                return q.get(timeout=30.0)
+            except queue.Empty:
+                raise TeamTalkError("Timed out waiting for TeamTalk command response")
+
         current_reply_id = 0
         success = False
         error: CommandError | None = None
